@@ -2,23 +2,28 @@ use rusttype::{Font, PositionedGlyph, Scale, Rect, point};
 use rusttype::gpu_cache::Cache;
 
 use vulkano::buffer::{CpuAccessibleBuffer, BufferUsage};
-use vulkano::command_buffer::{DynamicState, AutoCommandBufferBuilder, SubpassContents, PrimaryAutoCommandBuffer};
-use vulkano::descriptor::descriptor_set::{PersistentDescriptorSet};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, SubpassContents, PrimaryAutoCommandBuffer, CopyBufferToImageInfo, RenderPassBeginInfo};
+use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, Queue};
-use vulkano::format::{Format, ClearValue};
-use vulkano::render_pass::{Framebuffer, FramebufferAbstract, Subpass, RenderPass};
+use vulkano::format::Format;
+use vulkano::render_pass::{Framebuffer, Subpass, FramebufferCreateInfo};
 use vulkano::image::{SwapchainImage, ImmutableImage, ImageCreateFlags, ImageUsage, ImageLayout, ImageDimensions};
 use vulkano::image::view::ImageView;
-use vulkano::pipeline::vertex::SingleBufferDefinition;
-use vulkano::pipeline::viewport::Viewport;
-use vulkano::pipeline::{GraphicsPipeline, GraphicsPipelineAbstract};
-use vulkano::sampler::{Sampler, Filter, MipmapMode, SamplerAddressMode};
+use vulkano::pipeline::graphics::{vertex_input::BuffersDefinition,
+    input_assembly::InputAssemblyState, color_blend::ColorBlendState};
+use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::{GraphicsPipeline, PipelineBindPoint, Pipeline};
+use vulkano::sampler::{Sampler, Filter, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::swapchain::Swapchain;
+use vulkano::buffer::TypedBufferAccess;
+use vulkano::image::ImageAccess;
 
-use std::iter;
 use std::sync::Arc;
 
-#[derive(Default, Debug, Clone)]
+use bytemuck::{Pod, Zeroable};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
 struct Vertex {
     position:     [f32; 2],
     tex_position: [f32; 2],
@@ -51,31 +56,33 @@ pub struct DrawText {
     font:               Font<'static>,
     cache:              Cache<'static>,
     cache_pixel_buffer: Vec<u8>,
-    pipeline:           Arc<GraphicsPipeline<SingleBufferDefinition<Vertex>>>,
-    framebuffers:       Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
+    pipeline:           Arc<GraphicsPipeline>,
+    framebuffers:       Vec<Arc<Framebuffer>>,
     texts:              Vec<TextData>,
+    viewport:           Viewport,
 }
 
 const CACHE_WIDTH: usize = 1000;
 const CACHE_HEIGHT: usize = 1000;
 
 impl DrawText {
-    pub fn new<W>(device: Arc<Device>, queue: Arc<Queue>, swapchain: Arc<Swapchain<W>>, images: &[Arc<SwapchainImage<W>>]) -> DrawText where W: Send + Sync + 'static {
+    pub fn new<W>(device: Arc<Device>, queue: Arc<Queue>, swapchain: Arc<Swapchain<W>>, images: &[Arc<SwapchainImage<W>>]) -> DrawText where W: Send + Sync + 'static + std::fmt::Debug {
         let font_data = include_bytes!("DejaVuSans.ttf");
         let font = Font::from_bytes(font_data as &[u8]).unwrap();
 
-        let vs = vs::Shader::load(device.clone()).unwrap();
-        let fs = fs::Shader::load(device.clone()).unwrap();
+        let vs = vs::load(device.clone()).unwrap();
+        let fs = fs::load(device.clone()).unwrap();
 
         let cache = Cache::builder().dimensions(CACHE_WIDTH as u32, CACHE_HEIGHT as u32).build();
         let cache_pixel_buffer = vec!(0; CACHE_WIDTH * CACHE_HEIGHT);
 
-        let render_pass = Arc::new(vulkano::single_pass_renderpass!(device.clone(),
+        let render_pass = vulkano::single_pass_renderpass!(
+            device.clone(),
             attachments: {
                 color: {
                     load: Load,
                     store: Store,
-                    format: swapchain.format(),
+                    format: swapchain.image_format(),
                     samples: 1,
                 }
             },
@@ -83,35 +90,41 @@ impl DrawText {
                 color: [color],
                 depth_stencil: {}
             }
-        ).unwrap()) as Arc<RenderPass>;
+        )
+        .unwrap();
 
+        let dimensions = images[0].dimensions().width_height();
+        let viewport = Viewport {
+            origin: [0.0, 0.0],
+            dimensions: [dimensions[0] as f32, dimensions[1] as f32],
+            depth_range: 0.0..1.0,
+        }; 
         let framebuffers = images.iter().map(|image| {
-            let view = ImageView::new(image.clone()).unwrap();
-            Arc::new(
-                Framebuffer::start(render_pass.clone())
-                .add(view).unwrap()
-                .build().unwrap()
-            ) as Arc<dyn FramebufferAbstract + Send + Sync>
+            let view = ImageView::new_default(image.clone()).unwrap();
+            Framebuffer::new(
+                render_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![view],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
         }).collect::<Vec<_>>();
 
-        let pipeline = Arc::new(GraphicsPipeline::start()
-            .vertex_input_single_buffer()
-            .vertex_shader(vs.main_entry_point(), ())
-            .triangle_list()
-            .viewports(iter::once(Viewport {
-                origin:      [0.0, 0.0],
-                depth_range: 0.0..1.0,
-                dimensions:  [
-                    images[0].dimensions()[0] as f32,
-                    images[0].dimensions()[1] as f32
-                ],
-            }))
-            .fragment_shader(fs.main_entry_point(), ())
-            .blend_alpha_blending()
+        let blend_state = ColorBlendState::new(1).blend_alpha();
+        let pipeline = GraphicsPipeline::start()
+            .vertex_input_state(
+                BuffersDefinition::new()
+                .vertex::<Vertex>(),
+            )
+            .vertex_shader(vs.entry_point("main").unwrap(), ())
+            .input_assembly_state(InputAssemblyState::new())
+            .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
+            .fragment_shader(fs.entry_point("main").unwrap(), ())
+            .color_blend_state(blend_state)
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .build(device.clone())
-            .unwrap()
-        );
+            .unwrap();
 
         DrawText {
             device,
@@ -122,6 +135,7 @@ impl DrawText {
             pipeline,
             framebuffers,
             texts: vec!(),
+            viewport,
         }
     }
 
@@ -137,8 +151,8 @@ impl DrawText {
     }
 
     pub fn draw_text<'a>(&mut self, command_buffer: &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, image_num: usize) -> &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
-        let screen_width  = self.framebuffers[image_num].dimensions()[0];
-        let screen_height = self.framebuffers[image_num].dimensions()[1];
+        let screen_width  = self.framebuffers[image_num].extent()[0];
+        let screen_height = self.framebuffers[image_num].extent()[1];
         let cache_pixel_buffer = &mut self.cache_pixel_buffer;
         let cache = &mut self.cache;
 
@@ -163,7 +177,10 @@ impl DrawText {
 
         let buffer = CpuAccessibleBuffer::<[u8]>::from_iter(
             self.device.clone(),
-            BufferUsage::all(),
+            BufferUsage {
+                transfer_src: true,
+                ..BufferUsage::empty()
+            },
             false,
             cache_pixel_buffer.iter().cloned()
         ).unwrap();
@@ -171,44 +188,63 @@ impl DrawText {
         let (cache_texture, cache_texture_write) = ImmutableImage::uninitialized(
             self.device.clone(),
             ImageDimensions::Dim2d { width: CACHE_WIDTH as u32, height: CACHE_HEIGHT as u32, array_layers: 1 },
-            Format::R8Unorm,
+            Format::R8_UNORM,
             1,
             ImageUsage {
                 sampled: true,
-                transfer_destination: true,
-                .. ImageUsage::none()
+                transfer_dst: true,
+                .. ImageUsage::empty()
             },
-            ImageCreateFlags::none(),
+            ImageCreateFlags::empty(),
             ImageLayout::General,
-            Some(self.queue.family())
+            Some(self.queue.queue_family_index())
         ).unwrap();
 
         let sampler = Sampler::new(
             self.device.clone(),
-            Filter::Linear,
-            Filter::Linear,
-            MipmapMode::Nearest,
-            SamplerAddressMode::Repeat,
-            SamplerAddressMode::Repeat,
-            SamplerAddressMode::Repeat,
-            0.0, 1.0, 0.0, 0.0
-        ).unwrap();
+            SamplerCreateInfo {
+                min_filter: Filter::Linear,
+                mag_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        let cache_texture_view = ImageView::new(cache_texture).unwrap();
-
-        let set = Arc::new(
-            PersistentDescriptorSet::start(self.pipeline.layout().descriptor_set_layout(0).unwrap().clone())
-            .add_sampled_image(cache_texture_view, sampler).unwrap()
-            .build().unwrap()
-        );
+        let cache_texture_view = ImageView::new_default(cache_texture).unwrap();
+        let layout =
+            self.pipeline.layout().set_layouts().get(0).unwrap();
+        let set = PersistentDescriptorSet::new(
+            layout.clone(),
+            [WriteDescriptorSet::image_view_sampler(
+                0, cache_texture_view.clone(), sampler.clone(),
+            )],
+        )
+        .unwrap();
 
         let mut command_buffer = command_buffer
             .copy_buffer_to_image(
-                buffer,
-                cache_texture_write,
-            ).unwrap()
-            .begin_render_pass(self.framebuffers[image_num].clone(), SubpassContents::Inline, vec!(ClearValue::None)).unwrap();
-
+                CopyBufferToImageInfo::buffer_image(buffer, cache_texture_write)
+            )
+            .unwrap()
+            .begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![None],
+                    ..RenderPassBeginInfo::framebuffer(
+                        self.framebuffers[image_num].clone())
+                },
+                SubpassContents::Inline,
+            )
+            .unwrap()
+            .set_viewport(0, [self.viewport.clone()])
+            .bind_pipeline_graphics(self.pipeline.clone())
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.pipeline.layout().clone(),
+                0,
+                set.clone(),
+            );
+            
         // draw
         for text in &mut self.texts.drain(..) {
             let vertices: Vec<Vertex> = text.glyphs.iter().flat_map(|g| {
@@ -262,8 +298,22 @@ impl DrawText {
                 }
             }).collect();
 
-            let vertex_buffer = CpuAccessibleBuffer::from_iter(self.device.clone(), BufferUsage::all(), false, vertices.into_iter()).unwrap();
-            command_buffer = command_buffer.draw(self.pipeline.clone(), &DynamicState::none(), vertex_buffer.clone(), set.clone(), (), vec![]).unwrap();
+            if vertices.len() != 0 {
+                let vertex_buffer = CpuAccessibleBuffer::from_iter(
+                    self.device.clone(),
+                    BufferUsage {
+                        vertex_buffer: true,
+                        ..BufferUsage::empty()
+                    },
+                    false,
+                    vertices.into_iter(),
+                )
+                .unwrap();
+                command_buffer = command_buffer
+                    .bind_vertex_buffers(0, vertex_buffer.clone())
+                    .draw(vertex_buffer.len() as u32, 1, 0, 0)
+                    .unwrap();
+            }
         }
 
         command_buffer.end_render_pass().unwrap()

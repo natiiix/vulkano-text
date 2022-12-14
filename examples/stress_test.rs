@@ -1,18 +1,22 @@
 use vulkano_text::{DrawText, DrawTextTrait};
 
-use vulkano::command_buffer::{AutoCommandBufferBuilder, DynamicState, SubpassContents, CommandBufferUsage};
-use vulkano::device::{Device, DeviceExtensions};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, SubpassContents,
+     CommandBufferUsage, RenderPassBeginInfo};
+use vulkano::device::{Device, DeviceExtensions, DeviceCreateInfo,
+    QueueCreateInfo};
+use vulkano::device::physical::PhysicalDeviceType;
 use vulkano::format::Format;
-use vulkano::render_pass::{Framebuffer, FramebufferAbstract, RenderPass};
+use vulkano::render_pass::{Framebuffer, RenderPass, FramebufferCreateInfo};
 use vulkano::image::attachment::AttachmentImage;
-use vulkano::image::SwapchainImage;
+use vulkano::image::{SwapchainImage, ImageUsage, ImageAccess};
 use vulkano::image::view::ImageView;
-use vulkano::instance::{Instance, PhysicalDevice};
-use vulkano::pipeline::viewport::Viewport;
-use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreationError};
-use vulkano::{swapchain, Version};
+use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::pipeline::graphics::viewport::Viewport;
+use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreationError,
+    SwapchainCreateInfo, PresentInfo};
 use vulkano::sync::{GpuFuture, FlushError};
 use vulkano::sync;
+use vulkano::VulkanLibrary;
 
 use vulkano_win::VkSurfaceBuild;
 
@@ -28,27 +32,25 @@ fn window_size_dependent_setup(
     device: Arc<Device>,
     images: &[Arc<SwapchainImage<Window>>],
     render_pass: Arc<RenderPass>,
-    dynamic_state: &mut DynamicState
-) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
-    let dimensions = images[0].dimensions();
+    viewport: &mut Viewport,
+) -> Vec<Arc<Framebuffer>> {
+    let dimensions = images[0].dimensions().width_height();
+    viewport.dimensions = [dimensions[0] as f32, dimensions[1] as f32];
 
-    let viewport = Viewport {
-        origin: [0.0, 0.0],
-        dimensions: [dimensions[0] as f32, dimensions[1] as f32],
-        depth_range: 0.0 .. 1.0,
-    };
-    dynamic_state.viewports = Some(vec!(viewport));
-
-    let depthbuffer = AttachmentImage::transient(device.clone(), images[0].dimensions(), Format::D16Unorm).unwrap();
+    let depthbuffer = ImageView::new_default(
+        AttachmentImage::transient(device.clone(), dimensions, Format::D16_UNORM).unwrap()
+    )
+    .unwrap();
     images.iter().map(|image| {
-        let image_view = ImageView::new(image.clone()).unwrap();
-        let depth_view = ImageView::new(depthbuffer.clone()).unwrap();
-        Arc::new(
-            Framebuffer::start(render_pass.clone())
-                .add(image_view).unwrap()
-                .add(depth_view).unwrap()
-                .build().unwrap()
-        ) as Arc<dyn FramebufferAbstract + Send + Sync>
+        let image_view = ImageView::new_default(image.clone()).unwrap();
+        Framebuffer::new(
+            render_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![image_view, depthbuffer.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }).collect::<Vec<_>>()
 }
 
@@ -132,52 +134,116 @@ fn main() {
         None      => None,
     };
 
-    let required_extensions = vulkano_win::required_extensions();
-    let instance = Instance::new(None, Version::V1_2, &required_extensions, None).unwrap();
-    let physical = PhysicalDevice::enumerate(&instance).next().unwrap();
-    println!("Using device: {} (type: {:?})", physical.properties().device_name.as_ref().unwrap(), physical.properties().device_type.unwrap());
+    let library = VulkanLibrary::new().unwrap();
+    let required_extensions = vulkano_win::required_extensions(&library);
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            enabled_extensions: required_extensions,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let event_loop = EventLoop::new();
-    let window_builder = WindowBuilder::new();
-    let surface = window_builder.build_vk_surface(&event_loop, instance.clone()).unwrap();
-    let queue_family = physical.queue_families().find(|&q| {
-        q.supports_graphics() && surface.is_supported(q).unwrap_or(false)
-    }).unwrap();
-    let device_ext = DeviceExtensions { khr_swapchain: true, .. DeviceExtensions::none() };
-    let (device, mut queues) = Device::new(physical, physical.supported_features(), &device_ext,
-        [(queue_family, 0.5)].iter().cloned()).unwrap();
+    let surface = WindowBuilder::new().build_vk_surface(&event_loop, instance.clone()).unwrap();
+    let device_extensions = DeviceExtensions {
+        khr_swapchain: true,
+        ..DeviceExtensions::empty()
+    };
+
+    let (physical_device, queue_family_index) = instance
+        .enumerate_physical_devices()
+        .unwrap()
+        .filter(|p| p.supported_extensions().contains(&device_extensions))
+        .filter_map(|p| {
+            p.queue_family_properties()
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    q.queue_flags.graphics && p.surface_support(i as u32, &surface).unwrap_or(false)
+                })
+                .map(|i| (p, i as u32))
+        })
+        .min_by_key(|(p, _)| match p.properties().device_type {
+            PhysicalDeviceType::DiscreteGpu => 0,
+            PhysicalDeviceType::IntegratedGpu => 1,
+            PhysicalDeviceType::VirtualGpu => 2,
+            PhysicalDeviceType::Cpu => 3,
+            PhysicalDeviceType::Other => 4,
+            _ => 5,
+        })
+        .unwrap();
+
+    println!(
+        "Using device: {} (type: {:?})",
+        physical_device.properties().device_name,
+        physical_device.properties().device_type,
+    );
+
+    let (device, mut queues) = Device::new(
+        physical_device,
+        DeviceCreateInfo {
+            enabled_extensions: device_extensions,
+            queue_create_infos: vec![QueueCreateInfo {
+                queue_family_index,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
     let queue = queues.next().unwrap();
     let (mut swapchain, images) = {
-        let caps = surface.capabilities(physical).unwrap();
-        let usage = caps.supported_usage_flags;
-        let alpha = caps.supported_composite_alpha.iter().next().unwrap();
-        let format = caps.supported_formats[0].0;
-        let dimensions: [u32; 2] = surface.window().inner_size().into();
-        Swapchain::start(device.clone(), surface.clone())
-            .num_images(caps.min_image_count)
-            .format(format)
-            .dimensions(dimensions)
-            .usage(usage)
-            .sharing_mode(&queue)
-            .composite_alpha(alpha)
-            .build()
-            .unwrap()
+        let surface_capabilities = device
+            .physical_device()
+            .surface_capabilities(&surface, Default::default())
+            .unwrap();
+        let image_format = Some(
+            device
+                .physical_device()
+                .surface_formats(&surface, Default::default())
+                .unwrap()[0]
+                .0,
+        );
+
+        Swapchain::new(
+            device.clone(),
+            surface.clone(),
+            SwapchainCreateInfo {
+                min_image_count: surface_capabilities.min_image_count,
+                image_format,
+                image_extent: surface.window().inner_size().into(),
+                image_usage: ImageUsage {
+                    color_attachment: true,
+                    ..ImageUsage::empty()
+                },
+                composite_alpha: surface_capabilities
+                    .supported_composite_alpha
+                    .iter()
+                    .next()
+                    .unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
     };
 
     // include a depth buffer (unlike triangle.rs) to ensure vulkano-text isnt dependent on a specific render_pass
-    let render_pass = Arc::new(vulkano::single_pass_renderpass!(
+    let render_pass = vulkano::single_pass_renderpass!(
         device.clone(),
         attachments: {
             color: {
                 load: Clear,
                 store: Store,
-                format: swapchain.format(),
+                format: swapchain.image_format(),
                 samples: 1,
             },
             depth: {
                 load: Clear,
                 store: DontCare,
-                format: Format::D16Unorm,
+                format: Format::D16_UNORM,
                 samples: 1,
             }
         },
@@ -185,15 +251,19 @@ fn main() {
             color: [color],
             depth_stencil: {depth}
         }
-    ).unwrap());
+    ).unwrap();
 
     let mut draw_text = DrawText::new(device.clone(), queue.clone(), swapchain.clone(), &images);
 
     let (width, _): (u32, u32) = surface.window().inner_size().into();
     let mut x = 0.0;
 
-    let mut dynamic_state = DynamicState { line_width: None, viewports: None, scissors: None, compare_mask: None, write_mask: None, reference: None };
-    let mut framebuffers = window_size_dependent_setup(device.clone(), &images, render_pass.clone(), &mut dynamic_state);
+    let mut viewport = Viewport {
+        origin: [0.0, 0.0],
+        dimensions: [0.0, 0.0],
+        depth_range: 0.0..1.0,
+    };
+    let mut framebuffers = window_size_dependent_setup(device.clone(), &images, render_pass.clone(), &mut viewport);
     let mut recreate_swapchain = false;
     let mut previous_frame_end = Some(Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>);
 
@@ -210,15 +280,19 @@ fn main() {
             Event::RedrawEventsCleared => {
                 previous_frame_end.as_mut().unwrap().cleanup_finished();
                 if recreate_swapchain {
-                    let dimensions: [u32; 2] = surface.window().inner_size().into();
-                    let (new_swapchain, new_images) = match swapchain.recreate().dimensions(dimensions).build() {
+                     let (new_swapchain, new_images) = match swapchain.recreate(
+                        SwapchainCreateInfo{
+                            image_extent: surface.window().inner_size().into(),
+                            ..swapchain.create_info()
+                    }) {
                         Ok(r) => r,
-                        Err(SwapchainCreationError::UnsupportedDimensions) => return,
+                        Err(SwapchainCreationError::ImageExtentNotSupported { .. })
+                            => return,
                         Err(e) => panic!("Failed to recreate swapchain: {:?}", e)
                     };
 
                     swapchain = new_swapchain;
-                    framebuffers = window_size_dependent_setup(device.clone(), &new_images, render_pass.clone(), &mut dynamic_state);
+                    framebuffers = window_size_dependent_setup(device.clone(), &new_images, render_pass.clone(), &mut viewport);
 
                     draw_text = DrawText::new(device.clone(), queue.clone(), swapchain.clone(), &new_images);
 
@@ -231,12 +305,13 @@ fn main() {
                 else {
                     x += 2.0;
                 }
-                
                 for (i, line) in lines.iter().enumerate() {
                     draw_text.queue_text(x, (i + 1) as f32 * 15.0, 15.0, [1.0, 1.0, 1.0, 1.0], line);
                 }
-                
-                let (image_num, suboptimal, acquire_future) = match swapchain::acquire_next_image(swapchain.clone(), None) {
+
+                let (image_num, suboptimal, acquire_future) =
+                    match vulkano::swapchain::acquire_next_image(
+                        swapchain.clone(), None) {
                     Ok(r) => r,
                     Err(AcquireError::OutOfDate) => {
                         recreate_swapchain = true;
@@ -249,12 +324,29 @@ fn main() {
                     recreate_swapchain = true;
                 }
 
-                let clear_values = vec!([0.0, 0.0, 0.0, 1.0].into(), 1f32.into());
-                let mut builder = AutoCommandBufferBuilder::primary(device.clone(), queue.family(), CommandBufferUsage::OneTimeSubmit).unwrap();
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    device.clone(),
+                    queue.queue_family_index(),
+                    CommandBufferUsage::OneTimeSubmit
+                )
+                .unwrap();
 
                 builder
-                    .begin_render_pass(framebuffers[image_num].clone(), SubpassContents::Inline, clear_values).unwrap()
-                    .end_render_pass().unwrap()
+                    .begin_render_pass(
+                        RenderPassBeginInfo {
+                            clear_values: vec![
+                                Some([0.0, 0.0, 0.0, 1.0].into()),
+                                Some(1f32.into()), // Depthbuffer
+                            ],
+                            ..RenderPassBeginInfo::framebuffer(
+                                framebuffers[image_num].clone())
+                        },
+                        SubpassContents::Inline,
+                    )
+                    .unwrap()
+                    .set_viewport(0, [viewport.clone()])
+                    .end_render_pass()
+                    .unwrap()
                     .draw_text(&mut draw_text, image_num);
 
                 let command_buffer = builder.build().unwrap();
@@ -262,7 +354,13 @@ fn main() {
                 let future = previous_frame_end.take().unwrap()
                     .join(acquire_future)
                     .then_execute(queue.clone(), command_buffer).unwrap()
-                    .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
+                    .then_swapchain_present(
+                        queue.clone(),
+                        PresentInfo {
+                            index: image_num,
+                            ..PresentInfo::swapchain(swapchain.clone())
+                        },
+                    )
                     .then_signal_fence_and_flush();
 
                 match future {
