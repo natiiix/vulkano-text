@@ -79,15 +79,12 @@ const CACHE_WIDTH: usize = 1000;
 const CACHE_HEIGHT: usize = 1000;
 
 impl DrawText {
-    pub fn new<W>(
+    pub fn new(
         device: Arc<Device>,
         queue: Arc<Queue>,
         swapchain: Arc<Swapchain>,
         images: &[Arc<SwapchainImage>],
-    ) -> DrawText
-    where
-        W: Send + Sync + 'static + std::fmt::Debug,
-    {
+    ) -> DrawText {
         let font_data = include_bytes!("DejaVuSans.ttf");
         let font = Font::from_bytes(font_data as &[u8]).unwrap();
 
