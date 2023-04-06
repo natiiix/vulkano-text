@@ -1,8 +1,8 @@
 use rusttype::gpu_cache::Cache;
 use rusttype::{point, Font, PositionedGlyph, Rect, Scale};
 
-use vulkano::buffer::TypedBufferAccess;
-use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
+use vulkano::buffer::BufferUsage;
+use vulkano::buffer::{Buffer, BufferCreateInfo};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CopyBufferToImageInfo, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
     SubpassContents,
@@ -17,7 +17,8 @@ use vulkano::image::{
     ImageCreateFlags, ImageDimensions, ImageLayout, ImageUsage, ImmutableImage, SwapchainImage,
 };
 use vulkano::memory::allocator::{
-    FreeListAllocator, GenericMemoryAllocator, StandardMemoryAllocator,
+    AllocationCreateInfo, FreeListAllocator, GenericMemoryAllocator, MemoryUsage,
+    StandardMemoryAllocator,
 };
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::{
@@ -208,13 +209,16 @@ impl DrawText {
             })
             .unwrap();
 
-        let buffer = CpuAccessibleBuffer::<[u8]>::from_iter(
+        let buffer = Buffer::from_iter(
             &self.memory_allocator,
-            BufferUsage {
-                transfer_src: true,
-                ..BufferUsage::empty()
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
             },
-            false,
+            AllocationCreateInfo {
+                usage: MemoryUsage::Upload,
+                ..Default::default()
+            },
             cache_pixel_buffer.iter().cloned(),
         )
         .unwrap();
@@ -228,11 +232,7 @@ impl DrawText {
             },
             Format::R8_UNORM,
             1,
-            ImageUsage {
-                sampled: true,
-                transfer_dst: true,
-                ..ImageUsage::empty()
-            },
+            ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             ImageCreateFlags::empty(),
             ImageLayout::General,
             Some(self.queue.queue_family_index()),
@@ -343,13 +343,16 @@ impl DrawText {
                 .collect();
 
             if vertices.len() != 0 {
-                let vertex_buffer = CpuAccessibleBuffer::from_iter(
+                let vertex_buffer = Buffer::from_iter(
                     &self.memory_allocator,
-                    BufferUsage {
-                        vertex_buffer: true,
-                        ..BufferUsage::empty()
+                    BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
                     },
-                    false,
+                    AllocationCreateInfo {
+                        usage: MemoryUsage::Upload,
+                        ..Default::default()
+                    },
                     vertices.into_iter(),
                 )
                 .unwrap();
