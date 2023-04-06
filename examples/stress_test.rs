@@ -1,36 +1,42 @@
+use vulkano::command_buffer::allocator::{
+    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
+};
+use vulkano::memory::allocator::{
+    FreeListAllocator, GenericMemoryAllocator, StandardMemoryAllocator,
+};
 use vulkano_text::{DrawText, DrawTextTrait};
 
-use vulkano::command_buffer::{AutoCommandBufferBuilder, SubpassContents,
-     CommandBufferUsage, RenderPassBeginInfo};
-use vulkano::device::{Device, DeviceExtensions, DeviceCreateInfo,
-    QueueCreateInfo};
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, SubpassContents,
+};
 use vulkano::device::physical::PhysicalDeviceType;
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo};
 use vulkano::format::Format;
-use vulkano::render_pass::{Framebuffer, RenderPass, FramebufferCreateInfo};
 use vulkano::image::attachment::AttachmentImage;
-use vulkano::image::{SwapchainImage, ImageUsage, ImageAccess};
 use vulkano::image::view::ImageView;
+use vulkano::image::{ImageAccess, ImageUsage, SwapchainImage};
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::pipeline::graphics::viewport::Viewport;
-use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreationError,
-    SwapchainCreateInfo, PresentInfo};
-use vulkano::sync::{GpuFuture, FlushError};
+use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
+use vulkano::swapchain::{
+    AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError, SwapchainPresentInfo,
+};
 use vulkano::sync;
+use vulkano::sync::{FlushError, GpuFuture};
 use vulkano::VulkanLibrary;
 
-use vulkano_win::VkSurfaceBuild;
-
-use winit::window::{WindowBuilder, Window};
-use winit::event_loop::{EventLoop, ControlFlow};
+use vulkano_win::create_surface_from_handle;
 use winit::event::{Event, WindowEvent};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::window::WindowBuilder;
 
+use std::env;
 use std::sync::Arc;
 use std::time::Instant;
-use std::env;
 
 fn window_size_dependent_setup(
-    device: Arc<Device>,
-    images: &[Arc<SwapchainImage<Window>>],
+    memory_allocator: &GenericMemoryAllocator<Arc<FreeListAllocator>>,
+    images: &[Arc<SwapchainImage>],
     render_pass: Arc<RenderPass>,
     viewport: &mut Viewport,
 ) -> Vec<Arc<Framebuffer>> {
@@ -38,20 +44,23 @@ fn window_size_dependent_setup(
     viewport.dimensions = [dimensions[0] as f32, dimensions[1] as f32];
 
     let depthbuffer = ImageView::new_default(
-        AttachmentImage::transient(device.clone(), dimensions, Format::D16_UNORM).unwrap()
+        AttachmentImage::transient(memory_allocator, dimensions, Format::D16_UNORM).unwrap(),
     )
     .unwrap();
-    images.iter().map(|image| {
-        let image_view = ImageView::new_default(image.clone()).unwrap();
-        Framebuffer::new(
-            render_pass.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![image_view, depthbuffer.clone()],
-                ..Default::default()
-            },
-        )
-        .unwrap()
-    }).collect::<Vec<_>>()
+    images
+        .iter()
+        .map(|image| {
+            let image_view = ImageView::new_default(image.clone()).unwrap();
+            Framebuffer::new(
+                render_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![image_view, depthbuffer.clone()],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
 }
 
 fn main() {
@@ -131,7 +140,7 @@ fn main() {
     args.next();
     let benchmark_count = match args.next() {
         Some(arg) => arg.parse().ok(),
-        None      => None,
+        None => None,
     };
 
     let library = VulkanLibrary::new().unwrap();
@@ -146,7 +155,8 @@ fn main() {
     .unwrap();
 
     let event_loop = EventLoop::new();
-    let surface = WindowBuilder::new().build_vk_surface(&event_loop, instance.clone()).unwrap();
+    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
+    let surface = create_surface_from_handle(window.clone(), instance.clone()).unwrap();
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
         ..DeviceExtensions::empty()
@@ -214,7 +224,7 @@ fn main() {
             SwapchainCreateInfo {
                 min_image_count: surface_capabilities.min_image_count,
                 image_format,
-                image_extent: surface.window().inner_size().into(),
+                image_extent: window.inner_size().into(),
                 image_usage: ImageUsage {
                     color_attachment: true,
                     ..ImageUsage::empty()
@@ -251,11 +261,12 @@ fn main() {
             color: [color],
             depth_stencil: {depth}
         }
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut draw_text = DrawText::new(device.clone(), queue.clone(), swapchain.clone(), &images);
 
-    let (width, _): (u32, u32) = surface.window().inner_size().into();
+    let (width, _): (u32, u32) = window.inner_size().into();
     let mut x = 0.0;
 
     let mut viewport = Viewport {
@@ -263,7 +274,19 @@ fn main() {
         dimensions: [0.0, 0.0],
         depth_range: 0.0..1.0,
     };
-    let mut framebuffers = window_size_dependent_setup(device.clone(), &images, render_pass.clone(), &mut viewport);
+
+    let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
+    let command_buffer_allocator = StandardCommandBufferAllocator::new(
+        device.clone(),
+        StandardCommandBufferAllocatorCreateInfo::default(),
+    );
+
+    let mut framebuffers = window_size_dependent_setup(
+        &memory_allocator,
+        &images,
+        render_pass.clone(),
+        &mut viewport,
+    );
     let mut recreate_swapchain = false;
     let mut previous_frame_end = Some(Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>);
 
@@ -271,63 +294,82 @@ fn main() {
     let mut frames_rendered = 0;
     event_loop.run(move |event, _, control_flow| {
         match event {
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
                 *control_flow = ControlFlow::Exit;
-            },
-            Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
                 recreate_swapchain = true;
-            },
+            }
             Event::RedrawEventsCleared => {
                 previous_frame_end.as_mut().unwrap().cleanup_finished();
                 if recreate_swapchain {
-                     let (new_swapchain, new_images) = match swapchain.recreate(
-                        SwapchainCreateInfo{
-                            image_extent: surface.window().inner_size().into(),
+                    let (new_swapchain, new_images) =
+                        match swapchain.recreate(SwapchainCreateInfo {
+                            image_extent: window.inner_size().into(),
                             ..swapchain.create_info()
-                    }) {
-                        Ok(r) => r,
-                        Err(SwapchainCreationError::ImageExtentNotSupported { .. })
-                            => return,
-                        Err(e) => panic!("Failed to recreate swapchain: {:?}", e)
-                    };
+                        }) {
+                            Ok(r) => r,
+                            Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
+                            Err(e) => panic!("Failed to recreate swapchain: {:?}", e),
+                        };
 
                     swapchain = new_swapchain;
-                    framebuffers = window_size_dependent_setup(device.clone(), &new_images, render_pass.clone(), &mut viewport);
+                    framebuffers = window_size_dependent_setup(
+                        &memory_allocator,
+                        &new_images,
+                        render_pass.clone(),
+                        &mut viewport,
+                    );
 
-                    draw_text = DrawText::new(device.clone(), queue.clone(), swapchain.clone(), &new_images);
+                    draw_text = DrawText::new(
+                        device.clone(),
+                        queue.clone(),
+                        swapchain.clone(),
+                        &new_images,
+                    );
 
                     recreate_swapchain = false;
                 }
 
                 if x > width as f32 {
                     x = 0.0;
-                }
-                else {
+                } else {
                     x += 2.0;
                 }
                 for (i, line) in lines.iter().enumerate() {
-                    draw_text.queue_text(x, (i + 1) as f32 * 15.0, 15.0, [1.0, 1.0, 1.0, 1.0], line);
+                    draw_text.queue_text(
+                        x,
+                        (i + 1) as f32 * 15.0,
+                        15.0,
+                        [1.0, 1.0, 1.0, 1.0],
+                        line,
+                    );
                 }
 
                 let (image_num, suboptimal, acquire_future) =
-                    match vulkano::swapchain::acquire_next_image(
-                        swapchain.clone(), None) {
-                    Ok(r) => r,
-                    Err(AcquireError::OutOfDate) => {
-                        recreate_swapchain = true;
-                        return;
-                    },
-                    Err(e) => panic!("Failed to acquire next image: {:?}", e)
-                };
+                    match vulkano::swapchain::acquire_next_image(swapchain.clone(), None) {
+                        Ok(r) => r,
+                        Err(AcquireError::OutOfDate) => {
+                            recreate_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("Failed to acquire next image: {:?}", e),
+                    };
 
                 if suboptimal {
                     recreate_swapchain = true;
                 }
 
                 let mut builder = AutoCommandBufferBuilder::primary(
-                    device.clone(),
+                    &command_buffer_allocator,
                     queue.queue_family_index(),
-                    CommandBufferUsage::OneTimeSubmit
+                    CommandBufferUsage::OneTimeSubmit,
                 )
                 .unwrap();
 
@@ -339,7 +381,8 @@ fn main() {
                                 Some(1f32.into()), // Depthbuffer
                             ],
                             ..RenderPassBeginInfo::framebuffer(
-                                framebuffers[image_num].clone())
+                                framebuffers[image_num as usize].clone(),
+                            )
                         },
                         SubpassContents::Inline,
                     )
@@ -347,26 +390,26 @@ fn main() {
                     .set_viewport(0, [viewport.clone()])
                     .end_render_pass()
                     .unwrap()
-                    .draw_text(&mut draw_text, image_num);
+                    .draw_text(&mut draw_text, image_num as usize);
 
                 let command_buffer = builder.build().unwrap();
 
-                let future = previous_frame_end.take().unwrap()
+                let future = previous_frame_end
+                    .take()
+                    .unwrap()
                     .join(acquire_future)
-                    .then_execute(queue.clone(), command_buffer).unwrap()
+                    .then_execute(queue.clone(), command_buffer)
+                    .unwrap()
                     .then_swapchain_present(
                         queue.clone(),
-                        PresentInfo {
-                            index: image_num,
-                            ..PresentInfo::swapchain(swapchain.clone())
-                        },
+                        SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_num),
                     )
                     .then_signal_fence_and_flush();
 
                 match future {
                     Ok(future) => {
                         previous_frame_end = Some(Box::new(future) as Box<_>);
-                    },
+                    }
                     Err(FlushError::OutOfDate) => {
                         recreate_swapchain = true;
                         previous_frame_end = Some(Box::new(sync::now(device.clone())) as Box<_>);
@@ -382,13 +425,15 @@ fn main() {
                     if frames_rendered >= max_frames {
                         let duration = start.elapsed();
                         println!("Total Duration: {:?}", duration);
-                        println!("Average render Duration: {:?}", duration / frames_rendered as u32);
+                        println!(
+                            "Average render Duration: {:?}",
+                            duration / frames_rendered as u32
+                        );
                         *control_flow = ControlFlow::Exit;
                     }
                 }
-            },
-            _ => ()
+            }
+            _ => (),
         }
     });
 }
-
